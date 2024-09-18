@@ -9,12 +9,12 @@ from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, R
 load_dotenv()
 
 API_TOKEN = os.getenv('API_TOKEN')
-ADMIN_IDS = {838959024}  # Список ID администраторов
+ADMIN_IDS = set(map(int, os.getenv('ADMIN_IDS').split(',')))
+GROUP_ID = int(os.getenv('GROUP_ID'))
 
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
 
-GROUP_ID = -1001234567890  # Замените на ID вашей группы или канала
 
 # Соединение с базой данных SQLite
 def execute_query(query, args=(), fetch=False):
@@ -24,6 +24,7 @@ def execute_query(query, args=(), fetch=False):
         conn.commit()
         if fetch:
             return cursor.fetchall()
+
 
 # Инициализация базы данных
 def init_db():
@@ -40,10 +41,13 @@ def init_db():
                     )''')
     execute_query('''CREATE TABLE IF NOT EXISTS votes (
                         user_id INTEGER,
+                        user_name TEXT,
                         poll_id INTEGER,
                         option_id INTEGER,
-                        PRIMARY KEY (user_id, poll_id, option_id)
+                        PRIMARY KEY (user_id, poll_id, option_id),
+                        FOREIGN KEY (poll_id) REFERENCES polls (id)
                     )''')
+
 
 # Функция для создания клавиатуры с вариантами ответов
 def create_poll_keyboard(poll_id, selected_options=None, is_voting=True):
@@ -66,11 +70,13 @@ def create_poll_keyboard(poll_id, selected_options=None, is_voting=True):
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
     return keyboard
 
+
 # Функция для создания клавиатуры с завершением голосования
 def create_finish_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Голосование завершено", callback_data='voting_ended')]
     ])
+
 
 # Функция для создания главного меню
 def create_main_menu(is_admin=False):
@@ -85,140 +91,119 @@ def create_main_menu(is_admin=False):
     )
     return keyboard
 
+
 # Проверка на администратора
 def is_admin(user_id):
     return user_id in ADMIN_IDS
 
+
 # Команда для создания опроса
 @dp.message(Command('create_poll'))
-async def create_poll_command(message: Message):
+async def create_poll(message: Message):
     if not is_admin(message.from_user.id):
-        await message.answer("У вас нет прав для создания опросов.")
+        await message.reply("У вас нет прав для создания опроса.")
         return
-    
+
+    await message.reply("Введите команду для создания опроса в формате: Вопрос? Вариант 1, Вариант 2, Вариант 3",
+                        reply_markup=ReplyKeyboardMarkup(
+                            keyboard=[[KeyboardButton(text="Отмена")]],
+                            resize_keyboard=True
+                        ))
+
+
+# Обработчик текста для создания опроса
+@dp.message(F.text)
+async def handle_create_poll(message: Message):
+    if message.text.lower() == "отмена":
+        await message.reply("Создание опроса отменено.",
+                            reply_markup=create_main_menu(is_admin=is_admin(message.from_user.id)))
+        return
+
+    if not is_admin(message.from_user.id):
+        return
+
+    parts = message.text.split('?')
+    if len(parts) != 2:
+        await message.reply("Неправильный формат команды. Пример: Вопрос? Вариант 1, Вариант 2, Вариант 3")
+        return
+
+    question = parts[0].strip()
+    options = parts[1].split(',')
+    options = [option.strip() for option in options]
+
+    # Вставляем вопрос в базу данных
+    execute_query("INSERT INTO polls (question, active) VALUES (?, 0)", (question,))
+    poll_id = execute_query("SELECT last_insert_rowid()", fetch=True)[0][0]
+
+    # Вставляем варианты в базу данных
+    for option in options:
+        execute_query("INSERT INTO options (poll_id, option_text) VALUES (?, ?)", (poll_id, option))
+
+    await message.reply(f"Опрос создан. Используйте команду /start_poll {poll_id} для запуска опроса.",
+                        reply_markup=create_main_menu(is_admin=is_admin(message.from_user.id)))
+
+
+# Команда для запуска опроса
+@dp.message(Command('start_poll'))
+async def start_poll(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.reply("У вас нет прав для запуска опроса.")
+        return
+
     try:
-        command_text = message.text.split(' ', 1)[1].strip()
-        
-        if '?' not in command_text:
-            raise ValueError("Не найден знак вопроса '?' в команде.")
-        
-        question, options_text = command_text.split('?', 1)
-        question = question.strip() + '?'
-        options = [option.strip() for option in options_text.split(',')]
-
-        if len(options) < 2:
-            raise ValueError("Необходимо указать как минимум два варианта ответа.")
-        
-        execute_query("UPDATE polls SET active = 0 WHERE active = 1")
-
-        with sqlite3.connect('polls.db') as conn:
-            cursor = conn.cursor()
-            cursor.execute("INSERT INTO polls (question, active) VALUES (?, 1)", (question,))
-            poll_id = cursor.lastrowid
-
-            for option in options:
-                cursor.execute("INSERT INTO options (poll_id, option_text) VALUES (?, ?)", (poll_id, option))
-            conn.commit()
-
-        await bot.send_message(GROUP_ID, "Опрос создан! Используй кнопку 'Запустить опрос', чтобы начать.")
-    
-    except (IndexError, ValueError) as e:
-        await bot.send_message(GROUP_ID, f"Ошибка: {str(e)}\nПример: /create_poll Вопрос? Вариант 1, Вариант 2, Вариант 3")
-
-# Команда для старта опроса
-@dp.message(F.text == "Запустить опрос")
-async def start_poll_command(message: Message):
-    poll = execute_query("SELECT id, question, active FROM polls WHERE active = 1", fetch=True)
-
-    if not poll:
-        await bot.send_message(GROUP_ID, "Нет активных опросов.")
+        poll_id = int(message.text.split()[1])
+    except (IndexError, ValueError):
+        await message.reply("Введите команду для запуска опроса. Пример: /start_poll 1")
         return
 
-    poll_id, question, is_active = poll[0]
-    if is_active == 0:
-        await bot.send_message(GROUP_ID, "Опрос завершен. Результаты:")
+    # Помечаем опрос как активный
+    execute_query("UPDATE polls SET active = 1 WHERE id = ?", (poll_id,))
+
+    # Получаем вопрос и варианты
+    question = execute_query("SELECT question FROM polls WHERE id = ?", (poll_id,), fetch=True)
+    if question:
+        question = question[0][0]
+    else:
+        await message.reply("Опрос не найден.")
         return
 
-    user_votes = execute_query("SELECT option_id FROM votes WHERE user_id = ? AND poll_id = ?", (message.from_user.id, poll_id), fetch=True)
-    selected_options = {option_id for option_id, in user_votes}
-
-    poll_keyboard = create_poll_keyboard(poll_id, selected_options)
-    
-    if not poll_keyboard:
-        await bot.send_message(GROUP_ID, "Ошибка: невозможно создать клавиатуру для опроса.")
-        return
-    
-    await bot.send_message(
-        GROUP_ID,
-        f"Опрос: {question}\nВыберите один или несколько вариантов:",
-        reply_markup=poll_keyboard
-    )
-
-# Команда для создания нового опроса
-@dp.message(F.text == "Создать новый опрос")
-async def new_poll(message: Message):
-    if not is_admin(message.from_user.id):
-        await bot.send_message(GROUP_ID, "У вас нет прав для создания опросов.")
-        return
-    
-    await bot.send_message(
-        GROUP_ID,
-        "Введите команду для создания нового опроса. Пример: /create_poll Вопрос? Вариант 1, Вариант 2, Вариант 3",
-        reply_markup=create_main_menu(is_admin=True)
-    )
-
-# Команда для показа результатов
-@dp.message(F.text == "Показать результаты")
-async def show_results(message: Message):
-    active_poll = execute_query("SELECT id, question FROM polls WHERE active = 0", fetch=True)
-    if not active_poll:
-        await bot.send_message(GROUP_ID, "Нет завершенных опросов.")
+    options = execute_query("SELECT id, option_text FROM options WHERE poll_id = ?", (poll_id,), fetch=True)
+    if not options:
+        await message.reply("Варианты для опроса не найдены.")
         return
 
-    results_text = ""
-    for poll_id, question in active_poll:
-        results = execute_query("""
-            SELECT option_text, COUNT(votes.option_id) 
-            FROM options
-            LEFT JOIN votes ON options.id = votes.option_id
-            WHERE options.poll_id = ?
-            GROUP BY options.id
-        """, (poll_id,), fetch=True)
+    # Отправляем сообщение с опросом
+    poll_keyboard = create_poll_keyboard(poll_id)
+    if poll_keyboard:
+        await message.reply(f"Опрос: {question}\nВыберите один или несколько вариантов:", reply_markup=poll_keyboard)
+    else:
+        await message.reply("Ошибка: невозможно создать клавиатуру для опроса.")
 
-        result_text = "\n".join([f"{option}: {count} голосов" for option, count in results])
-        results_text += f"\n\nОпрос: {question}\n{result_text}"
 
-    await bot.send_message(GROUP_ID, results_text)
-
-# Команда для завершения активного голосования
-@dp.message(F.text == "Завершить активное голосование")
-async def finish_active_poll(message: Message):
-    if not is_admin(message.from_user.id):
-        await bot.send_message(GROUP_ID, "У вас нет прав для завершения активного голосования.")
-        return
-
-    execute_query("UPDATE polls SET active = 0 WHERE active = 1")
-    await bot.send_message(GROUP_ID, "Активное голосование завершено.")
-
-# Обработчики для нажатий кнопок
+# Обработчик голосования
 @dp.callback_query(F.data.startswith('vote:'))
 async def handle_vote(callback_query):
     _, poll_id, option_id = callback_query.data.split(':')
     poll_id = int(poll_id)
     option_id = int(option_id)
     user_id = callback_query.from_user.id
+    user_name = callback_query.from_user.username or "Unknown"  # Используйте username или "Unknown" если его нет
 
     # Обработка голосования
-    existing_vote = execute_query("SELECT option_id FROM votes WHERE user_id = ? AND poll_id = ?", (user_id, poll_id), fetch=True)
+    existing_vote = execute_query("SELECT option_id FROM votes WHERE user_id = ? AND poll_id = ?", (user_id, poll_id),
+                                  fetch=True)
     existing_votes = {vote_id for vote_id, in existing_vote}
-    
+
     if option_id in existing_votes:
-        execute_query("DELETE FROM votes WHERE user_id = ? AND poll_id = ? AND option_id = ?", (user_id, poll_id, option_id))
+        execute_query("DELETE FROM votes WHERE user_id = ? AND poll_id = ? AND option_id = ?",
+                      (user_id, poll_id, option_id))
     else:
-        execute_query("INSERT INTO votes (user_id, poll_id, option_id) VALUES (?, ?, ?)", (user_id, poll_id, option_id))
+        execute_query("INSERT INTO votes (user_id, user_name, poll_id, option_id) VALUES (?, ?, ?, ?)",
+                      (user_id, user_name, poll_id, option_id))
 
     # Получаем обновленные выбранные варианты для текущего пользователя
-    user_votes = execute_query("SELECT option_id FROM votes WHERE user_id = ? AND poll_id = ?", (user_id, poll_id), fetch=True)
+    user_votes = execute_query("SELECT option_id FROM votes WHERE user_id = ? AND poll_id = ?", (user_id, poll_id),
+                               fetch=True)
     selected_options = {option_id for option_id, in user_votes}
 
     # Получаем вопрос опроса
@@ -243,6 +228,7 @@ async def handle_vote(callback_query):
 
     await callback_query.answer()
 
+
 # Обработчик завершения голосования (кнопка "Проголосовать")
 @dp.callback_query(F.data.startswith('finish_vote'))
 async def finish_vote(callback_query):
@@ -260,14 +246,15 @@ async def finish_vote(callback_query):
 
     # Получаем результаты
     results = execute_query("""
-        SELECT option_text, COUNT(votes.option_id) 
+        SELECT option_text, user_name, COUNT(votes.option_id) 
         FROM options
         LEFT JOIN votes ON options.id = votes.option_id
         WHERE options.poll_id = ?
-        GROUP BY options.id
+        GROUP BY options.id, user_name
     """, (poll_id,), fetch=True)
 
-    result_text = "\n".join([f"{option}: {count} голосов" for option, count in results])
+    result_text = "\n".join(
+        [f"{option_text} - {user_name}: {count} голосов" for option_text, user_name, count in results])
     result_text = f"Ваш голос учтен.\n\nОпрос: {question}\n{result_text}"
 
     # Обновляем сообщение с результатами
@@ -278,6 +265,7 @@ async def finish_vote(callback_query):
     )
 
     await callback_query.answer()
+
 
 # Обработчик показа результатов
 @dp.callback_query(F.data.startswith('show_results'))
@@ -293,14 +281,15 @@ async def show_results(callback_query):
         question = "Вопрос не найден"
 
     results = execute_query("""
-        SELECT option_text, COUNT(votes.option_id) 
+        SELECT option_text, user_name, COUNT(votes.option_id) 
         FROM options
         LEFT JOIN votes ON options.id = votes.option_id
         WHERE options.poll_id = ?
-        GROUP BY options.id
+        GROUP BY options.id, user_name
     """, (poll_id,), fetch=True)
 
-    result_text = "\n".join([f"{option}: {count} голосов" for option, count in results])
+    result_text = "\n".join(
+        [f"{option_text} - {user_name}: {count} голосов" for option_text, user_name, count in results])
     result_text = f"Результаты опроса:\nВопрос: {question}\n{result_text}"
 
     # Обновляем сообщение с результатами
@@ -312,11 +301,51 @@ async def show_results(callback_query):
 
     await callback_query.answer()
 
-# Запуск бота
-async def main():
-    init_db()  # Инициализация базы данных
-    await dp.start_polling(bot)
 
+# Обработчик создания нового опроса
+@dp.message(F.text == "Создать новый опрос")
+async def create_new_poll(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.reply("У вас нет прав для создания опроса.")
+        return
+    await message.reply("Введите команду для создания опроса в формате: Вопрос? Вариант 1, Вариант 2, Вариант 3",
+                        reply_markup=ReplyKeyboardMarkup(
+                            keyboard=[[KeyboardButton(text="Отмена")]],
+                            resize_keyboard=True
+                        ))
+
+
+# Обработчик запуска опроса
+@dp.message(F.text == "Запустить опрос")
+async def start_poll_menu(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.reply("У вас нет прав для запуска опроса.")
+        return
+    await message.reply("Введите команду для запуска опроса в формате: /start_poll <poll_id>")
+
+
+# Обработчик показа результатов
+@dp.message(F.text == "Показать результаты")
+async def show_results_menu(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.reply("У вас нет прав для показа результатов.")
+        return
+    await message.reply("Введите команду для показа результатов в формате: /show_results <poll_id>")
+
+
+# Обработчик завершения активного голосования
+@dp.message(F.text == "Завершить активное голосование")
+async def end_active_poll(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.reply("У вас нет прав для завершения голосования.")
+        return
+    execute_query("UPDATE polls SET active = 0 WHERE active = 1")
+    await message.reply("Активное голосование завершено.", reply_markup=create_main_menu(is_admin=True))
+
+
+# Основной блок
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+    init_db()
+    from aiogram import executor
+
+    executor.start_polling(dp, skip_updates=True)
